@@ -5,6 +5,7 @@ import traceback
 from argparse import ArgumentParser, Namespace, FileType
 import copy
 import os
+import random
 from functools import partial
 import warnings
 from typing import Mapping, Optional
@@ -21,6 +22,7 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from rdkit import RDLogger
+from rdkit import rdBase
 from rdkit.Chem import RemoveAllHs
 
 # TODO imports are a little odd, utils seems to shadow things
@@ -102,6 +104,13 @@ def get_parser():
     parser.add_argument('--gnina_autobox_add', type=float, default=4.0)
     parser.add_argument('--gnina_poses_to_optimize', type=int, default=1)
 
+    parser.add_argument('--seed', type=int, default=0, help='Random seed for deterministic inference')
+    parser.add_argument('--use_physics', action='store_true', default=True, help='Enable physics guidance during sampling')
+    parser.add_argument('--no_physics', action='store_false', dest='use_physics', help='Disable physics guidance during sampling')
+    parser.add_argument('--physics_step_size', type=float, default=0.05, help='Step size for physics guidance')
+    parser.add_argument('--physics_debug', action='store_true', default=False, help='Log physics energy/grad norms during sampling')
+    parser.add_argument('--physics_trace', action='store_true', default=False, help='Log coordinate displacement caused by physics at each step')
+    parser.add_argument('--physics_last_steps', type=int, default=-1, help='Apply physics only in the last N steps; -1 means all steps')
     return parser
 
 
@@ -119,6 +128,22 @@ def main(args):
                     arg_dict[key].append(v)
             else:
                 arg_dict[key] = value
+
+    # Deterministic behavior where possible
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        # RDKit conformer generation
+        try:
+            rdBase.DisableLog('rdApp.error')
+            rdBase.RandomSeed(args.seed)
+        except Exception:
+            pass
 
     # Download models if they don't exist locally
     if not os.path.exists(args.model_dir):
@@ -150,6 +175,7 @@ def main(args):
             confidence_args = Namespace(**yaml.full_load(f))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     logger.info(f"DiffDock will run on {device}")
 
     if args.protein_ligand_csv is not None:
@@ -237,7 +263,7 @@ def main(args):
             else:
                 confidence_data_list = None
             data_list = [copy.deepcopy(orig_complex_graph) for _ in range(N)]
-            randomize_position(data_list, score_model_args.no_torsion, False, score_model_args.tr_sigma_max,
+            randomize_position(data_list, score_model_args.no_torsion, True, score_model_args.tr_sigma_max,
                                initial_noise_std_proportion=args.initial_noise_std_proportion,
                                choose_residue=args.choose_residue)
 
@@ -263,7 +289,10 @@ def main(args):
                                              device=device, t_to_sigma=t_to_sigma, model_args=score_model_args,
                                              visualization_list=visualization_list, confidence_model=confidence_model,
                                              confidence_data_list=confidence_data_list, confidence_model_args=confidence_args,
-                                             batch_size=args.batch_size, no_final_step_noise=args.no_final_step_noise,
+                                             batch_size=args.batch_size, no_random=True, no_final_step_noise=args.no_final_step_noise,
+                                             use_physics=args.use_physics, physics_step_size=args.physics_step_size,
+                                             physics_debug=args.physics_debug, physics_trace=args.physics_trace,
+                                             physics_last_steps=args.physics_last_steps,
                                              temp_sampling=[args.temp_sampling_tr, args.temp_sampling_rot,
                                                             args.temp_sampling_tor],
                                              temp_psi=[args.temp_psi_tr, args.temp_psi_rot, args.temp_psi_tor],
@@ -299,7 +328,7 @@ def main(args):
                         visualization_list[batch_idx].write(os.path.join(write_dir, f'rank{rank+1}_reverseprocess.pdb'))
 
         except Exception as e:
-            logger.warning("Failed on", orig_complex_graph["name"], e)
+            logger.warning(f"Failed on {orig_complex_graph['name']}: {e}")
             failures += 1
 
     result_msg = f"""

@@ -31,7 +31,7 @@ def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, pocket_kn
             print("No pocket residue below minimum distance ", pocket_cutoff, "taking closest at", torch.min(d))
             center_pocket = complex['receptor'].pos[torch.argmin(torch.min(d, dim=1)[0])]
 
-    if not no_torsion:
+    if not no_torsion and not no_random:
         # randomize torsion angles
         for complex_graph in data_list:
             torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=complex_graph['ligand'].edge_mask.sum())
@@ -42,8 +42,13 @@ def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, pocket_kn
                                                 complex_graph['ligand'].mask_rotate[0], torsion_updates)
 
     for complex_graph in data_list:
-        # randomize position
         molecule_center = torch.mean(complex_graph['ligand'].pos, dim=0, keepdim=True)
+        if no_random:
+            # Deterministic placement at the pocket center with original orientation.
+            complex_graph['ligand'].pos = complex_graph['ligand'].pos - molecule_center + center_pocket
+            continue
+
+        # randomize position
         random_rotation = torch.from_numpy(R.random().as_matrix()).float()
         complex_graph['ligand'].pos = (complex_graph['ligand'].pos - molecule_center) @ random_rotation.T + center_pocket
         # base_rmsd = np.sqrt(np.sum((complex_graph['ligand'].pos.cpu().numpy() - orig_complex_graph['ligand'].pos.numpy()) ** 2, axis=1).mean())
@@ -98,6 +103,10 @@ def sampling(
     # NEW: Option-A simple physics guidance
     physics_potentials=None,
     physics_step_size: float = 0.05,
+    use_physics: bool = True,
+    physics_debug: bool = False,
+    physics_trace: bool = False,
+    physics_last_steps: int = -1,
 ):
     N = len(data_list)
     trajectory = []
@@ -118,11 +127,11 @@ def sampling(
         confidence_loader = iter(DataLoader(confidence_data_list, batch_size=batch_size))
         confidence = []
 
-    # Initialize physics if user passed None
-    use_physics = physics_potentials is not None
-    if physics_potentials is None:
+    # Initialize physics if enabled
+    if not use_physics:
+        physics_potentials = None
+    elif physics_potentials is None:
         physics_potentials = build_default_potentials()
-        use_physics = True
 
     with torch.no_grad():
         for batch_id, complex_graph_batch in enumerate(loader):
@@ -232,7 +241,15 @@ def sampling(
                 # ============================================================
                 #            Option A: Simple Physics Guidance
                 # ============================================================
-                if use_physics and physics_step_size > 0.0:
+                apply_physics = (
+                    use_physics
+                    and physics_potentials is not None
+                    and physics_step_size > 0.0
+                    and (physics_last_steps < 0 or t_idx >= inference_steps - physics_last_steps)
+                )
+
+                if apply_physics:
+                    coords_before_physics = candidate_pos_flat.clone() if physics_trace else None
                     full_grad = torch.zeros_like(candidate_pos_flat)
 
                     with torch.enable_grad():
@@ -250,14 +267,52 @@ def sampling(
                             if feats_i is None:
                                 continue
 
+                            # Ensure features live on the same device as coords_i.
+                            feats_i = {
+                                key: (val.to(coords_i.device) if torch.is_tensor(val) else val)
+                                for key, val in feats_i.items()
+                            }
+
+                            # Skip physics if feature indices don't match coordinate count.
+                            max_bad = False
+                            n_atoms_i = coords_i.shape[0]
+                            for key in ("bond_index", "angle_index"):
+                                if key in feats_i and torch.is_tensor(feats_i[key]) and feats_i[key].numel() > 0:
+                                    if feats_i[key].max() >= n_atoms_i:
+                                        max_bad = True
+                                        break
+                            if max_bad:
+                                continue
+
                             E_i = coords_i.new_tensor(0.0)
+                            debug_terms = []
                             for pot in physics_potentials:
                                 E_i = E_i + pot.weight * pot.energy(coords_i, feats_i)
+                                if physics_debug:
+                                    debug_terms.append((pot.__class__.__name__, float(E_i.detach().cpu())))
 
                             (grad_i,) = torch.autograd.grad(E_i, coords_i, retain_graph=False)
                             full_grad[start:end] = grad_i.detach()
 
+                            if physics_debug and batch_id == 0 and i == 0:
+                                grad_norm = grad_i.detach().norm().item()
+                                # Only log once per step to avoid spam.
+                                logger.info(
+                                    f"[Physics] step {t_idx}: grad_norm={grad_norm:.4f}; "
+                                    + "; ".join([f"{n}={v:.4f}" for n, v in debug_terms])
+                                )
+
                     candidate_pos_flat = candidate_pos_flat - physics_step_size * full_grad
+
+                    if physics_trace and coords_before_physics is not None:
+                        disp = candidate_pos_flat - coords_before_physics
+                        # Report only for first sample in batch to keep logs concise.
+                        disp_sample = disp[:n]
+                        mean_disp = disp_sample.norm(dim=-1).mean().item()
+                        max_disp = disp_sample.norm(dim=-1).max().item()
+                        logger.info(
+                            f"[PhysicsTrace] step {t_idx}: mean_disp={mean_disp:.4f} Å; max_disp={max_disp:.4f} Å"
+                        )
 
                 # Commit physics + diffdock update
                 complex_graph_batch['ligand'].pos = candidate_pos_flat

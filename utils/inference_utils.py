@@ -1,6 +1,6 @@
 import os
 from esm import FastaBatchedDataset, pretrained
-from rdkit.Chem import AddHs, MolFromSmiles
+from rdkit.Chem import AddHs, MolFromSmiles, RemoveAllHs
 from torch_geometric.data import Dataset, HeteroData
 import numpy as np
 import torch
@@ -9,6 +9,7 @@ import esm
 
 from datasets.process_mols import generate_conformer, read_molecule, get_lig_graph_with_matching, moad_extract_receptor_structure
 from datasets.parse_chi import aa_idx2aa_short, get_onehot_sequence
+from physics.ligand_features import compute_ligand_features_from_rdkit
 
 
 def get_sequences_from_pdbfile(file_path):
@@ -69,18 +70,25 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences):
     repr_layers = [(i + model.num_layers + 1) % (model.num_layers + 1) for i in repr_layers]
     embeddings = {}
 
+    # force model on CPU just in case
+    model = model.cpu()
+    model.eval()
+
     with torch.no_grad():
         for batch_idx, (labels, strs, toks) in enumerate(data_loader):
             print(f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)")
-            if torch.cuda.is_available():
-                toks = toks.to(device="cuda", non_blocking=True)
+
+            # IMPORTANT: keep toks on CPU; do NOT move to cuda
+            # toks = toks.to(device="cuda", non_blocking=True)
 
             out = model(toks, repr_layers=repr_layers, return_contacts=False)
-            representations = {layer: t.to(device="cpu") for layer, t in out["representations"].items()}
+            # reps already on CPU, but be explicit
+            representations = {layer: t.cpu() for layer, t in out["representations"].items()}
 
             for i, label in enumerate(labels):
                 truncate_len = min(truncation_seq_length, len(strs[i]))
                 embeddings[label] = representations[33][i, 1: truncate_len + 1].clone()
+
     return embeddings
 
 
@@ -138,9 +146,12 @@ class InferenceDataset(Dataset):
             print("Generating ESM language model embeddings")
             model_location = "esm2_t33_650M_UR50D"
             model, alphabet = pretrained.load_model_and_alphabet(model_location)
+            # model.eval()
+            # if torch.cuda.is_available():
+            #     model = model.cuda()
+            model = model.cpu()
             model.eval()
-            if torch.cuda.is_available():
-                model = model.cuda()
+            torch.set_grad_enabled(False)
 
             protein_sequences = get_sequences(protein_files, protein_sequences)
             labels, sequences = [], []
@@ -166,7 +177,7 @@ class InferenceDataset(Dataset):
         if None in protein_files:
             print("generating missing structures with ESMFold")
             model = esm.pretrained.esmfold_v1()
-            model = model.eval().cuda()
+            model = model.cpu().eval() 
 
             for i in range(len(protein_files)):
                 if protein_files[i] is None:
@@ -238,5 +249,10 @@ class InferenceDataset(Dataset):
 
         complex_graph.original_center = protein_center
         complex_graph.mol = mol
+
+        # Precompute ligand physics features for inference-time steering.
+        mol_for_feats = RemoveAllHs(mol) if self.remove_hs else mol
+        complex_graph.ligand_feats = compute_ligand_features_from_rdkit(mol_for_feats, device=None)
+
         complex_graph['success'] = True
         return complex_graph
