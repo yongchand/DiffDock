@@ -11,11 +11,15 @@ limit_failures: 5
 model_dir: ./workdir/v1.1/score_model
 no_final_step_noise: true
 no_model: false
-no_random: false
-no_random_pocket: false
+no_random: true
+no_random_pocket: true
 ode: false
 old_filtering_model: true
 old_score_model: false
+physics_step_size: 0.05
+physics_debug: true
+physics_trace: true
+physics_last_steps: 18
 resample_rdkit: false
 samples_per_complex: 10
 sigma_schedule: expbeta
@@ -28,3 +32,4 @@ temp_sampling_tr: 1.170050527854316
 temp_sigma_data_rot: 0.7464326999906034
 temp_sigma_data_tor: 0.6943254174849822
 temp_sigma_data_tr: 0.9299802531572672
+use_physics: true
