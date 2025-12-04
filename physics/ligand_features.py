@@ -123,7 +123,7 @@ def compute_ligand_features_from_rdkit(
         chiral_rows.append([idx, nbrs[0], nbrs[1], nbrs[2]])
         chiral_orients.append(label == "R")  # True=R, False=S
     chiral_atom_index = (
-        torch.tensor(chiral_rows, dtype=torch.long, device=device).T
+        torch.tensor(chiral_rows, dtype=torch.long, device=device)
         if chiral_rows
         else torch.empty((4, 0), dtype=torch.long, device=device)
     )
@@ -148,7 +148,7 @@ def compute_ligand_features_from_rdkit(
         stereo_rows.append([atoms[0], i, j, atoms[1]])
         stereo_orients.append(stereo == rdchem.BondStereo.STEREOE)  # True=E, False=Z
     stereo_bond_index = (
-        torch.tensor(stereo_rows, dtype=torch.long, device=device).T
+        torch.tensor(stereo_rows, dtype=torch.long, device=device)
         if stereo_rows
         else torch.empty((4, 0), dtype=torch.long, device=device)
     )
