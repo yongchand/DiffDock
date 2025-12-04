@@ -6,7 +6,8 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor
 from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
+from rdkit.Chem import rdMolTransforms, rdchem
+
 
 
 # A tiny VDW radii table (Å); extend if needed.
@@ -116,11 +117,38 @@ def compute_ligand_features_from_rdkit(
         angle_index = torch.zeros((0, 3), dtype=torch.long, device=device)
         angle_ref = torch.zeros((0,), dtype=torch.float32, device=device)
 
+    # Planar (improper) dihedrals for double/conjugated bonds with sp2 ends
+    planar_quads = []
+    for bond in mol.GetBonds():
+        if not (bond.GetBondType() == rdchem.BondType.DOUBLE or bond.GetIsConjugated()):
+            continue
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if mol.GetAtomWithIdx(i).GetHybridization() != rdchem.HybridizationType.SP2:
+            continue
+        if mol.GetAtomWithIdx(j).GetHybridization() != rdchem.HybridizationType.SP2:
+            continue
+        nbr_i = [n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j]
+        nbr_j = [n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i]
+        if not nbr_i or not nbr_j:
+            continue
+        for a in nbr_i:
+            for b in nbr_j:
+                planar_quads.append((a, i, j, b))
+
+    if planar_quads:
+        planar_improper_index = torch.tensor(planar_quads, dtype=torch.long, device=device)  # (P, 4)
+        planar_ref = torch.zeros((len(planar_quads),), dtype=torch.float32, device=device)   # target angle = 0
+    else:
+        planar_improper_index = torch.zeros((0, 4), dtype=torch.long, device=device)
+        planar_ref = torch.zeros((0,), dtype=torch.float32, device=device)
+
     feats = {
         "vdw_radius": vdw,                # (N,)
         "bond_index": bond_index,         # (M, 2)
         "bond_ref_length": bond_ref_length,  # (M,)
         "angle_index": angle_index,       # (K, 3)
         "angle_ref": angle_ref,           # (K,)
+        "planar_improper_index": planar_improper_index,  # (P, 4)
+        "planar_ref": planar_ref,                         # (P,)
     }
     return feats
