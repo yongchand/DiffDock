@@ -185,6 +185,46 @@ class AnglePotential(Potential):
         # Unweighted energy; Potential.total_energy() multiplies by self.weight
         return (diff ** 2).sum()
 
+class PlanarityPotential(Potential):
+    """
+    feats:
+      - "planar_improper_index": (P, 4) int64 (a, i, j, b)
+      - "planar_ref": (P,) float32  0
+      - "planar_weight": (P,)
+    """
+
+    def __init__(self, buffer: float = 0.2618, weight: float = 0.05):
+        super().__init__(weight=weight)
+        self.buffer = buffer
+
+    def energy(self, coords: Tensor, feats: Dict[str, Tensor]) -> Tensor:
+        idx = feats.get("planar_improper_index", None)
+        if idx is None or idx.numel() == 0:
+            return coords.new_tensor(0.0)
+
+        ref = feats.get("planar_ref", coords.new_zeros((idx.shape[0],)))
+        w = feats.get("planar_weight", None)
+
+        p0, p1, p2, p3 = coords[idx[:, 0]], coords[idx[:, 1]], coords[idx[:, 2]], coords[idx[:, 3]]
+        b0, b1, b2 = p1 - p0, p2 - p1, p3 - p2
+        eps = 1e-9
+        b1_norm = torch.norm(b1, dim=-1, keepdim=True).clamp(min=eps)
+        n1 = torch.nn.functional.normalize(torch.cross(b0, b1, dim=-1), dim=-1)
+        n2 = torch.nn.functional.normalize(torch.cross(b1, b2, dim=-1), dim=-1)
+        m1 = torch.cross(n1, b1 / b1_norm, dim=-1)
+
+        x = (n1 * n2).sum(-1)
+        y = (m1 * n2).sum(-1)
+        phi = torch.abs(torch.atan2(y, x))  
+
+        diff = torch.relu(phi - self.buffer)  
+        diff = diff - ref  
+        if w is not None:
+            diff = diff * w
+
+        return (diff ** 2).sum()
+
+
 
 def build_default_potentials() -> List[Potential]:
     """
@@ -196,4 +236,5 @@ def build_default_potentials() -> List[Potential]:
         BondLengthPotential(weight=1.0),
         AnglePotential(weight=0.2),
         VDWClashPotential(overlap_frac=0.8, weight=0.5),
+        PlanarityPotential(buffer=0.2618, weight=0.05),
     ]
